@@ -1,0 +1,14 @@
+image:
+  repository: jenkins-ha
+  tag: v1.0
+  pullPolicy: Never
+
+replicaCount: 2
+namespace: jenkins-ha
+
+storage:
+  size: 10Gi
+  hostPath: /run/desktop/mnt/host/c/jenkins-shared-data
+
+service:
+  nodePort: 32000
