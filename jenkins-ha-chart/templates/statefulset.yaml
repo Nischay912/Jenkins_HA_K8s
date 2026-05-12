@@ -1,0 +1,180 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jenkins-ha
+  namespace: {{ .Values.namespace }}
+  annotations:
+    imageTag: {{ .Values.image.tag | quote }}
+spec:
+  serviceName: "jenkins-ha"
+  replicas: {{ .Values.replicaCount }}
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+  podManagementPolicy: Parallel
+
+  selector:
+    matchLabels:
+      app: jenkins-ha
+
+  template:
+    metadata:
+      labels:
+        app: jenkins-ha
+      annotations:
+        imageTag: {{ .Values.image.tag | quote }}
+        rollme: {{ now | toString | b64enc | quote }}
+
+    spec:
+      serviceAccountName: jenkins-sa
+      terminationGracePeriodSeconds: 0
+
+      containers:
+
+        # MAIN JENKINS CONTAINER
+        - name: jenkins
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: TZ
+              value: "Asia/Kolkata"
+            - name: JENKINS_IMAGE_VERSION
+              value: {{ .Values.image.tag | quote }}
+          ports:
+            - containerPort: 8080
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "--------------------------------------------"
+              echo " Pod        : $(hostname)"
+              echo " Image Tag  : {{ .Values.image.tag }}"
+              echo "--------------------------------------------"
+              echo "Standby Mode: Waiting to be elected Leader..."
+              while [ ! -f /tmp/sync/is_leader ]; do
+                sleep 5
+              done
+              echo "Elected as Leader! Starting Jenkins..."
+              exec /usr/local/bin/jenkins.sh
+          volumeMounts:
+            - name: jenkins-storage
+              mountPath: /var/jenkins_home
+            - name: sync-dir
+              mountPath: /tmp/sync
+
+          # readinessProbe:
+          # httpGet:
+          #   path: /login
+          #   port: 8080
+          # initialDelaySeconds: 20
+          # periodSeconds: 10
+
+        # SIDECAR: LEADER ELECTION
+        - name: leader-election
+          image: bitnami/kubectl:latest
+
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "preStop: clearing lease before shutdown..."
+                  kubectl patch lease jenkins-leader -n {{ .Values.namespace }} \
+                    --type='merge' \
+                    -p '{"spec":{"holderIdentity":"","renewTime":null}}' || true
+                  rm -f /tmp/sync/is_leader
+                  echo "Lease cleared."
+
+          volumeMounts:
+            - name: sync-dir
+              mountPath: /tmp/sync
+
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Leader-election sidecar started on $(hostname)"
+
+              LAST_LEADER=$(kubectl get configmap jenkins-leader-history \
+                -n {{ .Values.namespace }} \
+                -o jsonpath='{.data.lastLeader}' 2>/dev/null || echo "")
+
+              echo "Last known leader was: '$LAST_LEADER'"
+
+              if [ "$LAST_LEADER" = "$(hostname)" ]; then
+                DELAY=45
+                echo "I was last leader. Waiting ${DELAY}s to let other pod win..."
+              else
+                DELAY=20
+                echo "I was standby (or first boot). Waiting ${DELAY}s then entering election..."
+              fi
+
+              sleep $DELAY
+
+              kubectl get lease jenkins-leader \
+                -n {{ .Values.namespace }} 2>/dev/null || \
+              cat <<EOF | kubectl create -f -
+              apiVersion: coordination.k8s.io/v1
+              kind: Lease
+              metadata:
+                name: jenkins-leader
+                namespace: {{ .Values.namespace }}
+              spec:
+                holderIdentity: ""
+              EOF
+
+              while true; do
+                HOLDER=$(kubectl get lease jenkins-leader \
+                  -n {{ .Values.namespace }} \
+                  -o jsonpath='{.spec.holderIdentity}')
+                RENEW_TIME=$(kubectl get lease jenkins-leader \
+                  -n {{ .Values.namespace }} \
+                  -o jsonpath='{.spec.renewTime}')
+
+                NOW=$(date +%s)
+                LEASE_TIME=$(date -d "$RENEW_TIME" +%s 2>/dev/null || echo 0)
+                DIFF=$((NOW - LEASE_TIME))
+
+                if [ "$HOLDER" = "" ] || \
+                   [ "$HOLDER" = "$(hostname)" ] || \
+                   [ "$DIFF" -gt 30 ]; then
+                  kubectl patch lease jenkins-leader \
+                    -n {{ .Values.namespace }} \
+                    --type='merge' \
+                    -p "{\"spec\":{\"holderIdentity\":\"$(hostname)\",\"renewTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)\"}}"
+                fi
+
+                sleep 1
+
+                ACTUAL_HOLDER=$(kubectl get lease jenkins-leader \
+                  -n {{ .Values.namespace }} \
+                  -o jsonpath='{.spec.holderIdentity}')
+
+                if [ "$ACTUAL_HOLDER" = "$(hostname)" ]; then
+                  touch /tmp/sync/is_leader
+
+                  kubectl patch configmap jenkins-leader-history \
+                    -n {{ .Values.namespace }} \
+                    --type='merge' \
+                    -p "{\"data\":{\"lastLeader\":\"$(hostname)\"}}" 2>/dev/null || true
+
+                  echo "[$(date)] LEADER   : $(hostname)"
+                else
+                  rm -f /tmp/sync/is_leader
+                  echo "[$(date)] STANDBY  : $(hostname) | Leader: $ACTUAL_HOLDER"
+                fi
+
+                sleep 3
+              done
+
+      volumes:
+        - name: jenkins-storage
+          persistentVolumeClaim:
+            claimName: jenkins-shared-pvc
+        - name: sync-dir
+          emptyDir: {}
